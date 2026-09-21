@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verified copying and moving via rsync. Python 3.9+, macOS/Linux.
 
-Only mv deletes sources, after successful verification. No replacement,
+Only mv and rm delete sources, after successful verification. No replacement,
 forced unmount, implicit sudo, or cleanup of failed copies.
 See README.md for supported storage, approval steps and verification limits.
 """
@@ -285,13 +285,20 @@ def check_entries(header, entries):
     require(files or dirs, 'Empty manifest refused.')
 
 
-def prepare(args):
+def prepare(args, existing_destination=False):
     source, dest, manifest = map(canonical, (args.source, args.destination, args.manifest))
-    require(not os.path.lexists(dest), 'Destination root must not exist; choose a new batch directory.')
+    if existing_destination:
+        require(dest.exists(), 'Destination does not exist: ' + repr(str(dest)))
+        require(not os.path.samefile(source, dest), 'Source and destination refer to the same object.')
+        require(source.is_dir() == dest.is_dir() and source.is_file() == dest.is_file(),
+                'Source and destination types do not match.')
+    else:
+        require(not os.path.lexists(dest), 'Destination root must not exist; choose a new batch directory.')
     require(not within(dest, source) and not within(source, dest), 'Overlapping roots refused.')
     vol = volume(existing_parent(dest))
     check_manifest_location(manifest, source, dest, vol)
-    separate_source(source, vol)
+    if not existing_destination:
+        separate_source(source, vol)
     dirs, files = walk_source(source)
     entries = [dict(type='directory', source=str(p), destination=str(dest / p.relative_to(source))) for p in dirs]
     for index, path in enumerate(files, 1):
@@ -307,7 +314,7 @@ def prepare(args):
         for item in entries:
             path = Path(item['source'])
             require(item['type'] != 'file' or path.stat().st_nlink == 1,
-                    'mv does not support hard-linked files: ' + repr(str(path)))
+                    'Source removal does not support hard-linked files: ' + repr(str(path)))
             item['move_metadata'] = move_metadata(path)
             item['source_identity'] = [path.stat().st_dev, path.stat().st_ino]
     check_entries(header, entries)
@@ -429,7 +436,17 @@ def move_metadata(path):
         os.close(fd)
 
 
-def preserve_move_metadata(entries):
+def destination_mtime_resolution(vol):
+    # macOS ufsd_NTFS can report a cached fractional mtime that is lost on
+    # remount. Write whole seconds before hashing; never tolerate later drift.
+    return 1_000_000_000 if vol['os'] == 'Darwin' and vol['fstype'].lower() == 'ufsd_ntfs' else 1
+
+
+def destination_times(info, mtime_resolution_ns):
+    return (info.st_atime_ns, info.st_mtime_ns - info.st_mtime_ns % mtime_resolution_ns)
+
+
+def preserve_move_metadata(entries, mtime_resolution_ns=1):
     # Set directory metadata last, after children have been created.
     for item in sorted(entries, key=lambda x: len(Path(x['destination']).parts), reverse=True):
         src, dst = Path(item['source']), Path(item['destination'])
@@ -443,7 +460,7 @@ def preserve_move_metadata(entries):
             file_attributes(target_fd, {k: v for k, v in original.items() if current.get(k) != v})
             st = os.fstat(source_fd)
             os.fchmod(target_fd, stat.S_IMODE(st.st_mode) & 0o777)
-            os.utime(target_fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+            os.utime(target_fd, ns=destination_times(st, mtime_resolution_ns))
         finally:
             os.close(source_fd)
             if target_fd is not None:
@@ -451,9 +468,8 @@ def preserve_move_metadata(entries):
     os.sync()
 
 
-def remove_verified_source(header, entries, journal, deletion):
-    """Delete only manifest entries. Never recursively remove unknown files."""
-    source = Path(header['source_root'])
+def check_removal_sources(header, entries):
+    """Check the entire source batch and metadata before removing any entry."""
     check_source(header, entries, hashes=True)
     for item in entries:
         src, dst = Path(item['source']), Path(item['destination'])
@@ -464,8 +480,15 @@ def remove_verified_source(header, entries, journal, deletion):
         actual = move_metadata(dst)
         require(all(actual.get(k) == v for k, v in expected.items()),
                 'Destination metadata does not match: ' + repr(str(dst)))
+
+
+def remove_verified_source(header, entries, journal, deletion):
+    """Delete only manifest entries. Never recursively remove unknown files."""
+    source = Path(header['source_root'])
+    check_removal_sources(header, entries)
     # Reuse the single checksum pass; subsequent checks inspect file state only.
-    check_verified_destination(header, entries, deletion['verified_destinations'])
+    check_verified_destination(header, entries, deletion['verified_destinations'], journal,
+                               phase='before_source_removal')
     clean_path(source.parent)
     parent_fd = os.open(source.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     mount = Path(header['volume']['mount'])
@@ -492,8 +515,8 @@ def remove_verified_source(header, entries, journal, deletion):
                 st = os.stat(src.name, dir_fd=src_parent, follow_symlinks=False)
                 require(signature(st) == sig, 'Source name was replaced before removal.')
                 target_stat = os.stat(dst.name, dir_fd=dst_parent, follow_symlinks=False)
-                require(signature(target_stat) == dest_sig and target_stat.st_dev == os.fstat(mount_fd).st_dev,
-                        'Destination changed before removal.')
+                check_destination_state(item, dest_sig, target_stat, os.fstat(mount_fd).st_dev,
+                                        journal, phase='before_file_removal')
                 journal.event('file_removal_start', source=str(src))
                 os.unlink(src.name, dir_fd=src_parent)
                 deletion['files'] += 1
@@ -535,6 +558,8 @@ def verify_files(header, entries, journal):
         if item['type'] == 'directory':
             require(path.is_dir(), 'Destination directory was replaced: ' + repr(str(path)))
             verified[str(path)] = signature(path.lstat())
+            journal.event('destination_snapshot', destination=str(path), object_type='directory',
+                          signature=verified[str(path)])
             continue
         print('Verifying {}/{}: {}'.format(checked + 1, header['files'], repr(str(path))), flush=True)
         checksum, sig = digest_file(path)
@@ -543,22 +568,59 @@ def verify_files(header, entries, journal):
             raise ChecksumError('DESTINATION CHECKSUM MISMATCH: ' + repr(str(path)))
         checked += 1
         verified[str(path)] = sig
-        journal.event('file_verified', destination=str(path), sha256=checksum)
+        journal.event('file_verified', destination=str(path), sha256=checksum, signature=sig)
     check_volume(header)
     require(checked == header['files'], 'Not all manifest files were verified.')
     return verified
 
 
-def check_verified_destination(header, entries, verified):
-    """Check identity/state against the checksum pass without rereading contents."""
+def check_destination_state(item, expected, info, mount_device, journal, *, phase,
+                            after_remount=False):
+    """Allow only the mount-local device number to change across a remount."""
+    actual = signature(info)
+    differences = {key: dict(before=value, after=actual[key])
+                   for key, value in expected.items() if value != actual[key]}
+    valid_type = stat.S_ISDIR(info.st_mode) if item['type'] == 'directory' else stat.S_ISREG(info.st_mode)
+    if not valid_type:
+        differences['object_type'] = dict(before=item['type'], after=stat.S_IFMT(info.st_mode))
+    if info.st_dev != mount_device:
+        differences['mount_device'] = dict(before=mount_device, after=info.st_dev)
+    # The caller has checked the UUID, mount path, filesystem type and every
+    # object's membership in the current mount. Inode/time/size changes remain fatal.
+    allowed = {'device'} if after_remount else set()
+    rejected = sorted(set(differences) - allowed)
+    journal.event('destination_state_checked', destination=item['destination'],
+                  object_type=item['type'], phase=phase, expected=expected, actual=actual,
+                  mount_device=mount_device, differences=differences,
+                  accepted=not rejected, allowed_changes=sorted(set(differences) & allowed))
+    require(not rejected, 'Destination changed since checksum verification: ' +
+            repr(item['destination']) + '; phase=' + phase + '; differences=' +
+            json.dumps(differences, ensure_ascii=True, sort_keys=True))
+    return actual
+
+
+def check_verified_destination(header, entries, verified, journal, *, after_remount=False,
+                               phase='within_mount'):
+    """Validate all entries, then return a baseline for strict checks in this mount."""
     check_volume(header)
+    mount = Path(header['volume']['mount'])
+    mount_device = mount.stat().st_dev
+    observed = {}
     for item in entries:
         path = Path(item['destination'])
-        clean_path(path)
-        info = path.lstat()
-        valid_type = stat.S_ISDIR(info.st_mode) if item['type'] == 'directory' else stat.S_ISREG(info.st_mode)
-        require(valid_type and signature(info) == verified[str(path)],
-                'Destination changed since checksum verification: ' + repr(str(path)))
+        try:
+            clean_path(path)
+            info = path.lstat()
+        except (OSError, Stop) as exc:
+            journal.event('destination_state_unavailable', destination=str(path), phase=phase,
+                          expected=verified[str(path)], error=str(exc))
+            raise
+        observed[str(path)] = check_destination_state(
+            item, verified[str(path)], info, mount_device, journal,
+            phase=phase, after_remount=after_remount)
+    check_volume(header)
+    require(mount.stat().st_dev == mount_device, 'Destination mount changed during state checks.')
+    return observed
 
 
 def remount_commands(vol, sudo=False, linux_method='system'):
@@ -660,7 +722,7 @@ def directory_fd(root_fd, relative, create=False):
         raise
 
 
-def copy_one(item, mount_fd, mount, rsync):
+def copy_one(item, mount_fd, mount, rsync, mtime_resolution_ns=1):
     src, dst = Path(item['source']), Path(item['destination'])
     clean_path(src)
     source_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -701,7 +763,7 @@ def copy_one(item, mount_fd, mount, rsync):
                     'Copied destination has unexpected type, size or filesystem: ' + repr(str(dst)))
             # Metadata policy stays in this wrapper, independent of rsync's defaults.
             os.fchmod(fd, stat.S_IMODE(before.st_mode) & 0o777)
-            os.utime(fd, ns=(before.st_atime_ns, before.st_mtime_ns))
+            os.utime(fd, ns=destination_times(before, mtime_resolution_ns))
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -720,6 +782,7 @@ def copy_files(header, entries, journal, rsync):
     mount = Path(header['volume']['mount'])
     mount_fd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     count = 0
+    mtime_resolution_ns = destination_mtime_resolution(header['volume'])
     try:
         check_volume(header)
         require(os.fstat(mount_fd).st_dev == mount.stat().st_dev, 'Mount changed while opening it.')
@@ -738,9 +801,21 @@ def copy_files(header, entries, journal, rsync):
             if item['type'] != 'file':
                 continue
             print('Copying {}/{}: {}'.format(count + 1, header['files'], repr(item['source'])), flush=True)
-            copy_one(item, mount_fd, mount, rsync)
+            copy_one(item, mount_fd, mount, rsync, mtime_resolution_ns)
             count += 1
             journal.event('file_copied', source=item['source'], destination=item['destination'], size=item['size'])
+        if mtime_resolution_ns > 1:
+            for item in (x for x in entries if x['type'] == 'directory'):
+                path = Path(item['destination'])
+                fd = directory_fd(mount_fd, path.relative_to(mount))
+                try:
+                    info = os.fstat(fd)
+                    times = destination_times(info, mtime_resolution_ns)
+                    os.utime(fd, ns=times)
+                    journal.event('directory_timestamp_normalized', destination=str(path),
+                                  before_mtime_ns=info.st_mtime_ns, requested_mtime_ns=times[1])
+                finally:
+                    os.close(fd)
     finally:
         os.close(mount_fd)
     check_source(header, entries, hashes=False)
@@ -778,22 +853,32 @@ def execute(args, verify_only=False):
         # Keep the process working directory off the external disk.
         os.chdir('/')
         if not verify_only:
+            mtime_resolution_ns = destination_mtime_resolution(actual)
+            journal.event('destination_timestamp_policy', mtime_resolution_ns=mtime_resolution_ns,
+                          rounding='floor', applies_to='new_destination_files_and_directories',
+                          filesystem=actual['fstype'])
+            if mtime_resolution_ns > 1:
+                print('Destination driver compatibility: copy mtime uses whole seconds; '
+                      'post-verification timestamp checks remain exact.', flush=True)
             print('Checking all sources against the manifest...', flush=True)
             check_source(header, entries, hashes=True)
             check_volume(header)
             print('Copy backend: ' + rsync, flush=True)
             copy_files(header, entries, journal, rsync)
             if moving:
-                preserve_move_metadata(entries)
+                preserve_move_metadata(entries, mtime_resolution_ns)
         verified = verify_files(header, entries, journal)
         journal.event('content_verified', files=header['files'], bytes=header['bytes'],
                       phase='standalone' if verify_only else 'before_remount')
         if not verify_only:
+            check_verified_destination(header, entries, verified, journal, phase='before_remount')
             if actual['external']:
                 remount(actual, journal, args.sudo_remount, args.linux_remount)
             else:
                 journal.event('remount_skipped', reason='internal volume')
-            check_verified_destination(header, entries, verified)
+            verified = check_verified_destination(
+                header, entries, verified, journal, after_remount=actual['external'],
+                phase='after_remount' if actual['external'] else 'within_mount')
         journal.event('verified', files=header['files'], bytes=header['bytes'],
                       remounted_in_this_run=not verify_only and actual['external'], sources_deleted=False,
                       checksum_verification_phase='standalone' if verify_only else 'before_remount',
@@ -816,13 +901,91 @@ def execute(args, verify_only=False):
         journal.close()
 
 
+def confirm_source_removal(header, journal):
+    source, dest = header['source_root'], header['destination_root']
+    journal.event('source_removal_confirmation_requested', source=source, destination=dest,
+                  files=header['files'], bytes=header['bytes'])
+    print('Verified destination: ' + repr(dest), flush=True)
+    print('Remove {} source files ({} bytes) and their empty directories from {}.'.format(
+        header['files'], header['bytes'], repr(source)), flush=True)
+    print('Removal bypasses Trash and is not atomic. Recovery requires copying back from '
+          'the verified destination; a failure may leave a partially removed source tree.', flush=True)
+    try:
+        answer = input('Confirm removal of these verified originals? [y/N]: ').strip().lower()
+    except (EOFError, OSError):
+        answer = ''
+    if answer != 'y':
+        journal.event('source_removal_declined', source=source)
+        raise Stop('Source removal not confirmed. No originals were removed.')
+    journal.event('source_removal_confirmed', source=source)
+
+
+def remove_existing_sources(args):
+    """Verify existing copies and remove originals, without copying or remounting."""
+    manifest = canonical(args.manifest)
+    log = canonical(args.log) if args.log is not None else manifest.with_suffix('.rm.log')
+    require(log != manifest, 'Log path matches the manifest; choose a different --log filename.')
+    header, entries, manifest_sha = load_manifest(manifest)
+    source, dest = Path(header['source_root']), Path(header['destination_root'])
+    clean_path(source)
+    require(not os.path.samefile(source, dest), 'Source and destination refer to the same object.')
+    require(source.name and not os.path.ismount(source) and source != canonical(Path.home()),
+            'Filesystem roots and the home directory cannot be removed as a whole.')
+    check_manifest_location(manifest, source, dest, header['volume'])
+    check_manifest_location(log, source, dest, header['volume'])
+    actual = check_volume(header)
+    require(not os.path.lexists(log), 'Log already exists; choose a new filename with --log: ' + str(log))
+    journal = Journal(log)
+    deletion = {'started': False, 'files': 0}
+    try:
+        journal.event('start', mode='rm', manifest=str(manifest), manifest_sha256=manifest_sha,
+                      volume=actual, files=header['files'], copy_backend=None)
+        print('Log: ' + str(log), flush=True)
+        os.chdir('/')
+        print('Checking source state against the manifest...', flush=True)
+        check_source(header, entries, hashes=False)
+        for item in entries:
+            path = Path(item['source'])
+            info = path.lstat()
+            require(item['type'] != 'file' or info.st_nlink == 1,
+                    'rm does not support hard-linked source files: ' + repr(str(path)))
+            # cp/run plans lack move metadata. Capture it now and require the
+            # destination to contain it too; never repair copies in this command.
+            if 'source_identity' not in item:
+                item['source_identity'] = [info.st_dev, info.st_ino]
+            if 'move_metadata' not in item:
+                item['move_metadata'] = move_metadata(path)
+            journal.event('removal_source_snapshot', source=str(path),
+                          source_identity=item['source_identity'], move_metadata=item['move_metadata'])
+        verified = verify_files(header, entries, journal)
+        journal.event('content_verified', files=header['files'], bytes=header['bytes'],
+                      phase='before_source_removal')
+        check_removal_sources(header, entries)
+        check_verified_destination(header, entries, verified, journal, phase='before_removal_confirmation')
+        confirm_source_removal(header, journal)
+        deletion['verified_destinations'] = verified
+        # Recheck after the prompt; files may have changed while it was open.
+        remove_verified_source(header, entries, journal, deletion)
+        print('REMOVED: {} files, {} bytes. Verified originals removed.'.format(header['files'], header['bytes']))
+    except BaseException as exc:
+        try:
+            journal.event('failed', error=str(exc), error_type=type(exc).__name__,
+                      sources_deleted=bool(deletion['files']), source_deletion_started=deletion['started'],
+                      source_files_removed=deletion['files'])
+        except OSError:
+            pass
+        raise
+    finally:
+        journal.close()
+
+
 def automatic_transfer(args):
     require(len(args.paths) >= 2, 'Specify SOURCE... DESTINATION.')
     destination = canonical(args.paths[-1])
     sources = []
     for operand in args.paths[:-1]:
         leaf = operand.rstrip(os.sep).rsplit(os.sep, 1)[-1]
-        require(args.action != 'mv' or leaf not in ('.', '..'), 'mv cannot remove . or .. operands.')
+        require(args.action == 'cp' or leaf not in ('.', '..'), 'Source removal cannot use . or .. operands.')
         source = canonical(operand)
         if operand.endswith(os.sep):
             require(source.is_dir(), 'A source ending in / must be a directory.')
@@ -847,7 +1010,14 @@ def automatic_transfer(args):
         require(source.name and not os.path.ismount(source) and source != canonical(Path.home()),
                 'Filesystem roots and the home directory cannot be transferred as a whole.')
         target = destination / source.name if destination.is_dir() else destination
-        require(not os.path.lexists(target), 'Destination already exists; refusing overwrite or merge: ' + str(target))
+        if args.action == 'rm':
+            clean_path(target)
+            require(target.exists(), 'Destination does not exist: ' + repr(str(target)))
+            require(not os.path.samefile(source, target), 'Source and destination refer to the same object.')
+            require(source.is_dir() == target.is_dir() and source.is_file() == target.is_file(),
+                    'Source and destination types do not match: ' + repr(str(target)))
+        else:
+            require(not os.path.lexists(target), 'Destination already exists; refusing overwrite or merge: ' + str(target))
         require(not any(within(target, p) or within(p, target) for p in sources), 'Source and destination overlap.')
         require(not any(source != p and (within(source, p) or within(p, source)) for p in sources),
                 'Overlapping sources are not supported.')
@@ -865,11 +1035,16 @@ def automatic_transfer(args):
         job.mkdir()
         task = argparse.Namespace(source=str(source), destination=str(target),
                                   manifest=str(job / 'plan.jsonl'), log=args.log,
-                                  move=args.action == 'mv', sudo_remount=args.sudo_remount,
-                                  linux_remount=args.linux_remount)
+                                  move=args.action in ('mv', 'rm'), sudo_remount=getattr(args, 'sudo_remount', False),
+                                  linux_remount=getattr(args, 'linux_remount', 'system'))
         print('{}: {} -> {}'.format(args.action.upper(), repr(str(source)), repr(str(target))), flush=True)
-        prepare(task)
-        execute(task)
+        prepare(task, existing_destination=args.action == 'rm')
+        if args.action == 'rm':
+            # This is a new automatic job, so the normal plan.log is available.
+            task.log = task.log or str(Path(task.manifest).with_suffix('.log'))
+            remove_existing_sources(task)
+        else:
+            execute(task)
 
 
 def parser():
@@ -896,6 +1071,12 @@ def parser():
             part.add_argument('--sudo-remount', action='store_true', help='Linux only: explicitly use sudo -n for umount/mount only.')
             part.add_argument('--linux-remount', choices=('system', 'udisks'), default='system',
                               help='Linux: system mount/umount, or UDisks for desktop/FUSE volumes.')
+    remove = sub.add_parser('rm', help='Verify existing copies, confirm, then remove originals; no copy or remount.')
+    remove.add_argument('paths', nargs='*', metavar='PATH', help='SOURCE... DESTINATION, as with mv; copies must already exist.')
+    remove.add_argument('--state-dir', help='Automatic manifest/log storage (default: ~/.local/state/safe-transfer).')
+    remove.add_argument('-r', '-R', '--recursive', action='store_true', help='Accepted for compatibility; directories are always recursive.')
+    remove.add_argument('--manifest', help='Alternatively use an existing plan instead of SOURCE... DESTINATION.')
+    remove.add_argument('--log', help='New event log; default: plan.log for paths or plan.rm.log for --manifest.')
     return root
 
 
@@ -906,6 +1087,14 @@ def main(argv=None):
             automatic_transfer(args)
         elif args.action == 'plan':
             prepare(args)
+        elif args.action == 'rm':
+            require(not (args.paths and args.manifest), 'Use SOURCE... DESTINATION or --manifest, not both.')
+            if args.paths:
+                automatic_transfer(args)
+            else:
+                require(args.manifest is not None, 'Specify SOURCE... DESTINATION.')
+                require(args.state_dir is None, '--state-dir applies only to SOURCE... DESTINATION.')
+                remove_existing_sources(args)
         else:
             execute(args, verify_only=args.action == 'verify')
         return 0
@@ -913,7 +1102,7 @@ def main(argv=None):
         print('FATAL: ' + str(exc), file=sys.stderr)
         return 3
     except KeyboardInterrupt:
-        print('INTERRUPTED: copies retained. Check the journal for source removal status if using mv.', file=sys.stderr)
+        print('INTERRUPTED: copies retained. Check the journal for source removal status if using mv or rm.', file=sys.stderr)
         return 130
     except (Stop, OSError, ValueError, KeyError, TypeError) as exc:
         print('STOP: ' + str(exc), file=sys.stderr)

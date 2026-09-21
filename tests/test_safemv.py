@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -603,6 +605,129 @@ class TransferTests(unittest.TestCase):
              mock.patch.object(t, 'remount_commands'), mock.patch.object(t, 'remount', side_effect=remount):
             self.assertEqual(self.auto('mv'), 2)
         self.assertTrue((self.source / 'data.txt').exists())
+        events = [json.loads(row) for row in next((self.base / 'jobs').glob('*/plan.log')).read_text().splitlines()]
+        failed = next(e for e in events if e['event'] == 'destination_state_checked' and not e['accepted'])
+        self.assertEqual(failed['phase'], 'after_remount')
+        self.assertIn('size', failed['differences'])
+        self.assertIn('differences=', events[-1]['error'])
+        self.assertFalse(events[-1]['source_deletion_started'])
+
+    def test_mv_accepts_new_mount_device_and_uses_new_baseline(self):
+        mount = self.base / 'target-volume'
+        mount.mkdir()
+        self.destination = mount / 'destination'
+        self.vol.update(external=True, mount=str(t.canonical(mount)))
+        canonical_destination = t.canonical(self.destination)
+        original_stat, original_fstat = os.stat, os.fstat
+        destination_inodes = set()
+        reads = []
+        original_digest = t.digest_file
+
+        def mapped(info):
+            if info.st_ino not in destination_inodes:
+                return info
+            values = {k: getattr(info, k) for k in dir(info) if k.startswith('st_')}
+            values['st_dev'] += 1000
+            return SimpleNamespace(**values)
+
+        def remount(*args):
+            destination_inodes.update(original_stat(p).st_ino for p in [mount, *mount.rglob('*')])
+
+        def digest(path):
+            if t.within(path, canonical_destination):
+                self.assertFalse(destination_inodes, 'Destination rehashed after remount')
+                reads.append(path)
+            return original_digest(path)
+
+        with mock.patch.object(t, 'check_manifest_location'), mock.patch.object(t, 'separate_source'), \
+             mock.patch.object(t, 'remount_commands'), mock.patch.object(t, 'remount', side_effect=remount), \
+             mock.patch.object(t, 'digest_file', side_effect=digest), \
+             mock.patch.object(os, 'stat', side_effect=lambda *a, **kw: mapped(original_stat(*a, **kw))), \
+             mock.patch.object(os, 'fstat', side_effect=lambda *a: mapped(original_fstat(*a))):
+            self.assertEqual(self.auto('mv'), 0)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(len(reads), 1)
+        events = [json.loads(row) for row in next((self.base / 'jobs').glob('*/plan.log')).read_text().splitlines()]
+        states = [e for e in events if e['event'] == 'destination_state_checked']
+        after = [e for e in states if e['phase'] == 'after_remount']
+        self.assertEqual(len(after), 2)
+        self.assertTrue(all(e['accepted'] and e['allowed_changes'] == ['device'] for e in after))
+        removal = [e for e in states if e['phase'] in ('before_source_removal', 'before_file_removal')]
+        self.assertTrue(removal)
+        self.assertTrue(all(e['accepted'] and not e['differences'] for e in removal))
+        self.assertTrue(any(e['event'] == 'destination_snapshot' and 'signature' in e for e in events))
+        self.assertTrue(any(e['event'] == 'file_verified' and 'signature' in e for e in events))
+
+    def test_mv_directory_timestamp_change_is_reported_and_blocks_removal(self):
+        self.vol['external'] = True
+        def remount(*args):
+            info = self.destination.stat()
+            os.utime(self.destination, ns=(info.st_atime_ns, info.st_mtime_ns + 1000000000))
+        with mock.patch.object(t, 'check_manifest_location'), mock.patch.object(t, 'separate_source'), \
+             mock.patch.object(t, 'remount_commands'), mock.patch.object(t, 'remount', side_effect=remount):
+            self.assertEqual(self.auto('mv'), 2)
+        events = [json.loads(row) for row in next((self.base / 'jobs').glob('*/plan.log')).read_text().splitlines()]
+        failed = next(e for e in events if e['event'] == 'destination_state_checked' and not e['accepted'])
+        self.assertEqual(failed['object_type'], 'directory')
+        diff = failed['differences']['mtime_ns']
+        self.assertEqual(diff['after'] - diff['before'], 1000000000)
+        self.assertFalse(events[-1]['source_deletion_started'])
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_ufsd_mv_sets_whole_seconds_before_hashing_and_remount(self):
+        self.vol.update(external=True, fstype='ufsd_NTFS')
+        original_time = 1738913512515436107
+        (self.source / 'empty').mkdir()
+        source_paths = [self.source, self.source / 'empty', self.source / 'data.txt']
+        for path in source_paths:
+            os.utime(path, ns=(original_time, original_time))
+        source_times = {p: p.stat().st_mtime_ns for p in source_paths}
+        expected_time = original_time // 1_000_000_000 * 1_000_000_000
+        original_verify = t.verify_files
+        calls = []
+
+        def assert_times():
+            self.assertEqual({p: p.stat().st_mtime_ns for p in source_paths}, source_times)
+            for path in [self.destination, *self.destination.rglob('*')]:
+                self.assertEqual(path.stat().st_mtime_ns, expected_time)
+
+        def verify(*args):
+            assert_times()
+            calls.append('verify')
+            return original_verify(*args)
+
+        def remount(*args):
+            assert_times()
+            calls.append('remount')
+
+        with mock.patch.object(t, 'check_manifest_location'), mock.patch.object(t, 'separate_source'), \
+             mock.patch.object(t, 'remount_commands'), mock.patch.object(t, 'remount', side_effect=remount), \
+             mock.patch.object(t, 'verify_files', side_effect=verify):
+            self.assertEqual(self.auto('mv'), 0)
+        self.assertEqual(calls, ['verify', 'remount'])
+        self.assertFalse(self.source.exists())
+        events = [json.loads(row) for row in next((self.base / 'jobs').glob('*/plan.log')).read_text().splitlines()]
+        policy = next(e for e in events if e['event'] == 'destination_timestamp_policy')
+        self.assertEqual(policy['mtime_resolution_ns'], 1_000_000_000)
+
+    def test_ufsd_cp_normalizes_new_directories_and_preserves_source_times(self):
+        self.vol.update(fstype='ufsd_NTFS')
+        original_time = 1738913512515436107
+        (self.source / 'empty').mkdir()
+        for path in [self.source, self.source / 'data.txt']:
+            os.utime(path, ns=(original_time, original_time))
+        self.assertEqual(self.auto('cp'), 0)
+        self.assertEqual((self.source / 'data.txt').stat().st_mtime_ns, original_time)
+        self.assertEqual(self.source.stat().st_mtime_ns, original_time)
+        for path in [self.destination, *self.destination.rglob('*')]:
+            self.assertEqual(path.stat().st_mtime_ns % 1_000_000_000, 0)
+
+    def test_ufsd_standalone_verify_never_sets_timestamps(self):
+        self.vol.update(fstype='ufsd_NTFS')
+        self.assertEqual(self.plan(), 0)
+        self.assertEqual(self.run_copy(), 0)
+        with mock.patch.object(os, 'utime', side_effect=AssertionError('verify must not change timestamps')):
+            self.assertEqual(self.verify(), 0)
 
     def test_mv_remount_error_blocks_removal_after_verification(self):
         self.vol['external'] = True
@@ -626,6 +751,274 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(self.run_copy(), 3)
             remount.assert_not_called()
         self.assertTrue((self.source / 'data.txt').exists())
+
+    def existing_copy(self):
+        self.assertEqual(self.plan(), 0)
+        self.assertEqual(self.run_copy(), 0)
+
+    def remove_copied_sources(self, answer='y', manifest=None, log=None):
+        args = ['rm', '--manifest', manifest or self.manifest]
+        if log:
+            args.extend(['--log', log])
+        with mock.patch('builtins.input', return_value=answer):
+            return self.cli(*args)
+
+    def test_rm_verifies_whole_batch_then_confirms_without_copy_or_remount(self):
+        (self.source / 'empty').mkdir()
+        (self.source / 'second.txt').write_bytes(b'second')
+        self.existing_copy()
+        before = {p: t.signature(p.stat()) for p in self.destination.rglob('*')}
+        original = t.digest_file
+        hashed = []
+        def digest(path):
+            if t.within(path, t.canonical(self.destination)):
+                hashed.append(path)
+            return original(path)
+        def confirm(prompt):
+            self.assertEqual(len(hashed), 2)
+            self.assertTrue((self.source / 'data.txt').exists())
+            self.assertTrue((self.source / 'second.txt').exists())
+            return 'y'
+        with mock.patch.object(t, 'copy_files', side_effect=AssertionError('No copying')), \
+             mock.patch.object(t, 'remount', side_effect=AssertionError('No remount')), \
+             mock.patch.object(t, 'preserve_move_metadata', side_effect=AssertionError('No metadata writes')), \
+             mock.patch.object(t, 'digest_file', side_effect=digest), mock.patch('builtins.input', side_effect=confirm):
+            self.assertEqual(self.cli('rm', '--manifest', self.manifest), 0)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(len(hashed), 2)
+        self.assertEqual(before, {p: t.signature(p.stat()) for p in self.destination.rglob('*')})
+        rows = [json.loads(row) for row in self.manifest.with_suffix('.rm.log').read_text().splitlines()]
+        self.assertEqual(rows[0]['mode'], 'rm')
+        self.assertEqual(rows[-1]['event'], 'moved')
+        self.assertEqual(rows[-1]['files'], 2)
+
+    def test_rm_uses_interrupted_mv_manifest_despite_old_destination_mtime(self):
+        with mock.patch.object(t, 'remove_verified_source', side_effect=t.Stop('simulated interruption')):
+            self.assertEqual(self.auto('mv'), 2)
+        manifest = next((self.base / 'jobs').glob('*/plan.jsonl'))
+        info = self.destination.stat()
+        os.utime(self.destination, ns=(info.st_atime_ns, info.st_mtime_ns // 1000000000 * 1000000000))
+        self.assertEqual(self.remove_copied_sources(manifest=manifest), 0)
+        self.assertFalse(self.source.exists())
+
+    def test_rm_corrupt_last_copy_preserves_entire_source_batch(self):
+        (self.source / 'zz-last.txt').write_bytes(b'last')
+        self.existing_copy()
+        (self.destination / 'zz-last.txt').write_bytes(b'FAIL')
+        with mock.patch('builtins.input') as question:
+            self.assertEqual(self.cli('rm', '--manifest', self.manifest), 3)
+            question.assert_not_called()
+        self.assertTrue((self.source / 'data.txt').exists())
+        self.assertTrue((self.source / 'zz-last.txt').exists())
+
+    def test_rm_missing_copy_preserves_sources(self):
+        self.existing_copy()
+        (self.destination / 'data.txt').rename(self.destination / 'renamed.txt')
+        self.assertEqual(self.remove_copied_sources(), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_rm_decline_preserves_sources_and_existing_log(self):
+        self.existing_copy()
+        old_log = self.log.read_bytes()
+        self.assertEqual(self.remove_copied_sources(answer='n'), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+        self.assertEqual(self.log.read_bytes(), old_log)
+        self.assertEqual(self.remove_copied_sources(), 2)
+        self.assertTrue(self.source.exists())
+
+    def test_rm_eof_never_removes_sources(self):
+        self.existing_copy()
+        with mock.patch('builtins.input', side_effect=EOFError):
+            self.assertEqual(self.cli('rm', '--manifest', self.manifest), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_rm_destination_change_during_confirmation_blocks_removal(self):
+        self.existing_copy()
+        def answer(prompt):
+            (self.destination / 'data.txt').write_bytes(b'changed after verification')
+            return 'y'
+        with mock.patch('builtins.input', side_effect=answer):
+            self.assertEqual(self.cli('rm', '--manifest', self.manifest), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_rm_source_change_during_confirmation_blocks_removal(self):
+        self.existing_copy()
+        def answer(prompt):
+            (self.source / 'new.txt').write_bytes(b'new source file')
+            return 'y'
+        with mock.patch('builtins.input', side_effect=answer):
+            self.assertEqual(self.cli('rm', '--manifest', self.manifest), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+        self.assertTrue((self.source / 'new.txt').exists())
+
+    def test_rm_missing_destination_metadata_blocks_removal(self):
+        self.existing_copy()
+        source = t.canonical(self.source)
+        with mock.patch.object(t, 'move_metadata', side_effect=lambda p: {'user.test': 'abc'} if t.within(p, source) else {}):
+            self.assertEqual(self.remove_copied_sources(), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_rm_wrong_volume_blocks_removal(self):
+        self.existing_copy()
+        self.vol['uuid'] = 'DIFFERENT-UUID'
+        self.assertEqual(self.remove_copied_sources(), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_rm_single_file_and_custom_log(self):
+        self.assertEqual(self.auto('cp', sources=[self.source / 'data.txt']), 0)
+        manifest = next((self.base / 'jobs').glob('*/plan.jsonl'))
+        log = self.base / 'custom-removal.log'
+        self.assertEqual(self.remove_copied_sources(manifest=manifest, log=log), 0)
+        self.assertFalse((self.source / 'data.txt').exists())
+        self.assertTrue(self.source.is_dir())
+        self.assertTrue(self.destination.is_file())
+        self.assertTrue(log.is_file())
+
+    def test_rm_paths_directory_into_existing_parent(self):
+        self.source = self.source.rename(self.base / '\u0411\u0435\u0441\u043f\u0440\u0438\u043d\u0446\u0438\u043f\u043d\u044b\u0435')
+        self.destination.mkdir()
+        self.assertEqual(self.auto('cp'), 0)
+        with mock.patch('builtins.input', return_value='y'), \
+             mock.patch.object(t, 'copy_files', side_effect=AssertionError('No copying during rm')), \
+             mock.patch.object(t, 'remount', side_effect=AssertionError('No remount during rm')):
+            self.assertEqual(self.auto('rm'), 0)
+        self.assertFalse(self.source.exists())
+        self.assertEqual((self.destination / self.source.name / 'data.txt').read_bytes(), b'original bytes\x00\xff')
+        logs = [p for p in (self.base / 'jobs').glob('*/plan.log') if '"mode": "rm"' in p.read_text()]
+        self.assertEqual(len(logs), 1)
+
+    def test_rm_paths_corrupt_copy_preserves_original(self):
+        self.destination.mkdir()
+        self.assertEqual(self.auto('cp'), 0)
+        (self.destination / self.source.name / 'data.txt').write_bytes(b'corrupt copy')
+        with mock.patch('builtins.input') as prompt:
+            self.assertEqual(self.auto('rm'), 3)
+            prompt.assert_not_called()
+        self.assertTrue((self.source / 'data.txt').is_file())
+
+    def test_rm_paths_file_to_renamed_copy(self):
+        source = self.source / 'data.txt'
+        self.assertEqual(self.auto('cp', sources=[source]), 0)
+        with mock.patch('builtins.input', return_value='y'):
+            self.assertEqual(self.auto('rm', sources=[source]), 0)
+        self.assertFalse(source.exists())
+        self.assertTrue(self.destination.is_file())
+
+    def test_rm_paths_multiple_files_into_directory(self):
+        second = self.base / 'second.txt'
+        second.write_bytes(b'second')
+        self.destination.mkdir()
+        sources = [self.source / 'data.txt', second]
+        self.assertEqual(self.auto('cp', sources=sources), 0)
+        with mock.patch('builtins.input', return_value='y') as prompt:
+            self.assertEqual(self.auto('rm', sources=sources), 0)
+            self.assertEqual(prompt.call_count, 2)
+        self.assertTrue(all(not p.exists() for p in sources))
+        self.assertEqual((self.destination / 'second.txt').read_bytes(), b'second')
+
+    def test_rm_paths_missing_target_never_creates_it(self):
+        self.assertEqual(self.auto('rm'), 2)
+        self.assertFalse(self.destination.exists())
+        self.assertTrue(self.source.exists())
+        self.assertFalse((self.base / 'jobs').exists())
+
+    def test_rm_paths_directory_slash_keeps_source_basename(self):
+        self.destination.mkdir()
+        self.assertEqual(self.auto('cp'), 0)
+        with mock.patch('builtins.input', return_value='y'):
+            self.assertEqual(self.auto('rm', sources=[str(self.source) + '/']), 0)
+        self.assertTrue((self.destination / self.source.name / 'data.txt').is_file())
+        self.assertFalse(self.source.exists())
+
+    def test_rm_paths_rejects_dot_and_identical_file(self):
+        self.destination.mkdir()
+        self.assertEqual(self.auto('rm', sources=[str(self.source) + '/.']), 2)
+        source = self.source / 'data.txt'
+        self.assertEqual(self.auto('rm', sources=[source], target=source), 2)
+        self.assertTrue(source.is_file())
+
+    def test_rm_paths_rejects_manifest_combination(self):
+        self.assertEqual(self.auto('rm', extra=['--manifest', self.manifest]), 2)
+        self.assertTrue(self.source.exists())
+
+    def test_rm_paths_requires_matching_nested_directory(self):
+        self.existing_copy()
+        # Like mv, an existing destination directory means DEST/SOURCE.name.
+        # Do not guess that the supplied directory is the exact copied root.
+        self.assertEqual(self.auto('rm'), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+
+class DestinationStateTests(unittest.TestCase):
+    def setUp(self):
+        self.item = dict(type='file', destination='/test-volume/file')
+        self.info = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_size=10,
+                                    st_mtime_ns=20, st_ctime_ns=30, st_ino=40, st_dev=50)
+        self.expected = t.signature(self.info)
+        self.journal = mock.Mock()
+
+    def check(self, after_remount=False, mount_device=50):
+        return t.check_destination_state(self.item, self.expected, self.info, mount_device,
+                                         self.journal, phase='test', after_remount=after_remount)
+
+    def test_device_change_within_mount_is_refused(self):
+        self.info.st_dev = 51
+        with self.assertRaisesRegex(t.Stop, 'device'):
+            self.check(mount_device=51)
+
+    def test_timestamp_policy_is_scoped_to_macos_ufsd_ntfs(self):
+        for system, filesystem in [('Darwin', 'apfs'), ('Darwin', 'ntfs'),
+                                   ('Linux', 'ntfs3'), ('Linux', 'ufsd_NTFS'), ('Linux', 'ext4')]:
+            with self.subTest(system=system, filesystem=filesystem):
+                self.assertEqual(t.destination_mtime_resolution(dict(os=system, fstype=filesystem)), 1)
+        self.assertEqual(t.destination_mtime_resolution(dict(os='Darwin', fstype='ufsd_NTFS')), 1_000_000_000)
+
+    def test_timestamp_floor_uses_integer_arithmetic(self):
+        for value, expected in [(1738913512515436107, 1738913512000000000),
+                                (1738913512000000000, 1738913512000000000), (-1, -1000000000)]:
+            with self.subTest(value=value):
+                info = SimpleNamespace(st_mtime_ns=value, st_atime_ns=123)
+                self.assertEqual(t.destination_times(info, 1_000_000_000), (123, expected))
+                self.assertEqual(t.destination_times(info, 1), (123, value))
+
+    def test_nested_mount_after_remount_is_refused(self):
+        self.info.st_dev = 51
+        with self.assertRaisesRegex(t.Stop, 'mount_device'):
+            self.check(after_remount=True, mount_device=52)
+
+    def test_only_device_change_is_allowed_for_files_and_directories(self):
+        for kind, mode in [('file', stat.S_IFREG), ('directory', stat.S_IFDIR)]:
+            with self.subTest(kind=kind):
+                self.item['type'] = kind
+                self.info.st_mode = mode | 0o755
+                self.info.st_dev = 51
+                observed = self.check(after_remount=True, mount_device=51)
+                self.assertEqual(observed['device'], 51)
+                self.assertEqual(self.expected['device'], 50)
+
+    def test_other_fields_remain_strict_across_remount(self):
+        for kind, mode in [('file', stat.S_IFREG), ('directory', stat.S_IFDIR)]:
+            for field, attr in [('size', 'st_size'), ('mtime_ns', 'st_mtime_ns'),
+                                ('ctime_ns', 'st_ctime_ns'), ('inode', 'st_ino')]:
+                with self.subTest(kind=kind, field=field):
+                    self.item['type'] = kind
+                    self.info.st_mode = mode | 0o755
+                    self.info.st_dev = 51
+                    old = getattr(self.info, attr)
+                    setattr(self.info, attr, old + 1)
+                    with self.assertRaisesRegex(t.Stop, field):
+                        self.check(after_remount=True, mount_device=51)
+                    event = self.journal.event.call_args.kwargs
+                    self.assertEqual(event['differences'][field], dict(before=old, after=old + 1))
+                    self.assertFalse(event['accepted'])
+                    setattr(self.info, attr, old)
+
+    def test_type_change_is_refused_even_with_identical_signature(self):
+        for mode in (stat.S_IFDIR, stat.S_IFLNK, stat.S_IFIFO):
+            with self.subTest(mode=mode):
+                self.info.st_mode = mode
+                with self.assertRaisesRegex(t.Stop, 'object_type'):
+                    self.check(after_remount=True)
 
 
 class PlatformTests(unittest.TestCase):
