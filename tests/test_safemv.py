@@ -948,6 +948,86 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.auto('rm'), 2)
         self.assertTrue((self.source / 'data.txt').exists())
 
+    def test_rm_accepts_only_destination_provenance_difference_and_logs_it(self):
+        self.existing_copy()
+        source = t.canonical(self.source)
+        def metadata(path):
+            return {'com.apple.provenance': 'source-hash' if t.within(path, source) else 'copy-hash',
+                    'com.apple.ResourceFork': 'same-resource-hash'}
+        with mock.patch.object(t.platform, 'system', return_value='Darwin'), \
+             mock.patch.object(t, 'move_metadata', side_effect=metadata):
+            self.assertEqual(self.remove_copied_sources(), 0)
+        self.assertFalse(self.source.exists())
+        rows = [json.loads(row) for row in self.manifest.with_suffix('.rm.log').read_text().splitlines()]
+        differences = [r for r in rows if r['event'] == 'destination_metadata_difference']
+        self.assertTrue(differences)
+        self.assertTrue(all(set(r['ignored_system_attributes']) == {'com.apple.provenance'} for r in differences))
+        self.assertTrue(all(not r['rejected_attributes'] for r in differences))
+        self.assertIn('before_file_removal', {r['phase'] for r in differences})
+
+    def test_rm_source_provenance_change_still_blocks_removal(self):
+        self.existing_copy()
+        source = t.canonical(self.source)
+        changed = []
+        def metadata(path):
+            return {'com.apple.provenance': ('changed' if changed else 'original')
+                    if t.within(path, source) else 'copy'}
+        def answer(prompt):
+            changed.append(True)
+            return 'y'
+        with mock.patch.object(t.platform, 'system', return_value='Darwin'), \
+             mock.patch.object(t, 'move_metadata', side_effect=metadata), mock.patch('builtins.input', side_effect=answer):
+            self.assertEqual(self.cli('rm', '--manifest', self.manifest), 2)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def test_move_metadata_never_writes_provenance_on_macos(self):
+        self.existing_copy()
+        source, destination = self.source / 'data.txt', self.destination / 'data.txt'
+        source_inode = source.stat().st_ino
+        writes = []
+        def attributes(fd, updates=None):
+            if updates is not None:
+                writes.append(updates)
+                return
+            if os.fstat(fd).st_ino == source_inode:
+                return {'com.apple.provenance': b'source', 'user.test': b'payload'}
+            return {'com.apple.provenance': b'destination'}
+        item = dict(source=str(source), destination=str(destination), move_metadata={})
+        with mock.patch.object(t.platform, 'system', return_value='Darwin'), \
+             mock.patch.object(t, 'move_metadata', return_value={}), \
+             mock.patch.object(t, 'file_attributes', side_effect=attributes):
+            t.preserve_move_metadata([item])
+        self.assertEqual(writes, [{'user.test': b'payload'}])
+
+
+class MetadataPolicyTests(unittest.TestCase):
+    def test_macos_provenance_may_differ_or_be_absent(self):
+        for actual in ({'com.apple.provenance': 'copy'}, {}):
+            journal = mock.Mock()
+            with mock.patch.object(t.platform, 'system', return_value='Darwin'):
+                t.check_destination_metadata('/copy', {'com.apple.provenance': 'source'}, actual,
+                                             journal, phase='test')
+            self.assertEqual(journal.event.call_args.kwargs['rejected_attributes'], {})
+            self.assertIn('com.apple.provenance', journal.event.call_args.kwargs['ignored_system_attributes'])
+
+    def test_other_attributes_are_strict_even_with_provenance_difference(self):
+        for attribute in ('com.apple.ResourceFork', 'com.apple.FinderInfo', 'com.apple.quarantine',
+                          'com.apple.macl', 'user.test', 'com.apple.provenance.custom'):
+            for actual in ({attribute: 'changed'}, {}):
+                with self.subTest(attribute=attribute, actual=actual):
+                    journal = mock.Mock()
+                    expected = {attribute: 'original', 'com.apple.provenance': 'source'}
+                    with mock.patch.object(t.platform, 'system', return_value='Darwin'):
+                        with self.assertRaisesRegex(t.Stop, attribute):
+                            t.check_destination_metadata('/copy', expected, actual, journal, phase='test')
+                    self.assertIn(attribute, journal.event.call_args.kwargs['rejected_attributes'])
+
+    def test_provenance_exception_is_not_used_on_linux(self):
+        with mock.patch.object(t.platform, 'system', return_value='Linux'):
+            with self.assertRaisesRegex(t.Stop, 'com.apple.provenance'):
+                t.check_destination_metadata('/copy', {'com.apple.provenance': 'source'}, {},
+                                             mock.Mock(), phase='test')
+
 
 class DestinationStateTests(unittest.TestCase):
     def setUp(self):

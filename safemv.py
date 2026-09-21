@@ -446,6 +446,24 @@ def destination_times(info, mtime_resolution_ns):
     return (info.st_atime_ns, info.st_mtime_ns - info.st_mtime_ns % mtime_resolution_ns)
 
 
+def system_managed_attributes():
+    # macOS assigns provenance to the creating/modifying application. Copies
+    # need not share it with originals; leave the OS-managed value untouched.
+    return {'com.apple.provenance'} if platform.system() == 'Darwin' else set()
+
+
+def check_destination_metadata(path, expected, actual, journal, *, phase):
+    differences = {name: dict(expected_sha256=value, actual_sha256=actual.get(name))
+                   for name, value in expected.items() if actual.get(name) != value}
+    ignored = {k: v for k, v in differences.items() if k in system_managed_attributes()}
+    rejected = {k: v for k, v in differences.items() if k not in ignored}
+    if differences:
+        journal.event('destination_metadata_difference', destination=str(path), phase=phase,
+                      ignored_system_attributes=ignored, rejected_attributes=rejected)
+    require(not rejected, 'Destination metadata does not match: ' + repr(str(path)) +
+            '; phase=' + phase + '; attributes=' + json.dumps(rejected, sort_keys=True))
+
+
 def preserve_move_metadata(entries, mtime_resolution_ns=1):
     # Set directory metadata last, after children have been created.
     for item in sorted(entries, key=lambda x: len(Path(x['destination']).parts), reverse=True):
@@ -457,7 +475,8 @@ def preserve_move_metadata(entries, mtime_resolution_ns=1):
         try:
             target_fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             original, current = file_attributes(source_fd), file_attributes(target_fd)
-            file_attributes(target_fd, {k: v for k, v in original.items() if current.get(k) != v})
+            file_attributes(target_fd, {k: v for k, v in original.items()
+                                       if k not in system_managed_attributes() and current.get(k) != v})
             st = os.fstat(source_fd)
             os.fchmod(target_fd, stat.S_IMODE(st.st_mode) & 0o777)
             os.utime(target_fd, ns=destination_times(st, mtime_resolution_ns))
@@ -468,7 +487,7 @@ def preserve_move_metadata(entries, mtime_resolution_ns=1):
     os.sync()
 
 
-def check_removal_sources(header, entries):
+def check_removal_sources(header, entries, journal):
     """Check the entire source batch and metadata before removing any entry."""
     check_source(header, entries, hashes=True)
     for item in entries:
@@ -478,14 +497,13 @@ def check_removal_sources(header, entries):
         expected = item['move_metadata']
         require(move_metadata(src) == expected, 'Source metadata changed: ' + repr(str(src)))
         actual = move_metadata(dst)
-        require(all(actual.get(k) == v for k, v in expected.items()),
-                'Destination metadata does not match: ' + repr(str(dst)))
+        check_destination_metadata(dst, expected, actual, journal, phase='before_source_removal')
 
 
 def remove_verified_source(header, entries, journal, deletion):
     """Delete only manifest entries. Never recursively remove unknown files."""
     source = Path(header['source_root'])
-    check_removal_sources(header, entries)
+    check_removal_sources(header, entries, journal)
     # Reuse the single checksum pass; subsequent checks inspect file state only.
     check_verified_destination(header, entries, deletion['verified_destinations'], journal,
                                phase='before_source_removal')
@@ -510,8 +528,8 @@ def remove_verified_source(header, entries, journal, deletion):
                 dest_sig = deletion['verified_destinations'][str(dst)]
                 require(move_metadata(src) == item['move_metadata'], 'Source metadata changed before removal.')
                 target_meta = move_metadata(dst)
-                require(all(target_meta.get(k) == v for k, v in item['move_metadata'].items()),
-                        'Destination metadata changed before removal.')
+                check_destination_metadata(dst, item['move_metadata'], target_meta, journal,
+                                           phase='before_file_removal')
                 st = os.stat(src.name, dir_fd=src_parent, follow_symlinks=False)
                 require(signature(st) == sig, 'Source name was replaced before removal.')
                 target_stat = os.stat(dst.name, dir_fd=dst_parent, follow_symlinks=False)
@@ -960,7 +978,7 @@ def remove_existing_sources(args):
         verified = verify_files(header, entries, journal)
         journal.event('content_verified', files=header['files'], bytes=header['bytes'],
                       phase='before_source_removal')
-        check_removal_sources(header, entries)
+        check_removal_sources(header, entries, journal)
         check_verified_destination(header, entries, verified, journal, phase='before_removal_confirmation')
         confirm_source_removal(header, journal)
         deletion['verified_destinations'] = verified

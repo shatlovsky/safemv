@@ -10,7 +10,7 @@ Verified file copy and move for macOS and Linux.
 - macOS: `diskutil` and `ls`. Writing to NTFS requires a compatible driver. The system-provided `openrsync` is supported.
 - Linux: util-linux (`findmnt`, `lsblk`, `mount`, and `umount`). UDisks mode also requires `udisksctl`, the UDisks service, and appropriate polkit permissions.
 
-The test suite contains 106 tests and has passed on macOS using the installed `openrsync`. Volume discovery and remount operations are mocked in tests. Native Linux execution and compatibility with all external filesystem drivers have not been verified. The project is currently alpha software.
+The test suite contains 112 tests and has passed on macOS using the installed `openrsync`. Volume discovery and remount operations are mocked in tests. Native Linux execution and compatibility with all external filesystem drivers have not been verified. The project is currently alpha software.
 
 ## Installation and usage
 
@@ -150,6 +150,8 @@ Do not modify the source or destination while a transfer is running. These check
 Timestamp precision depends on the operating system and filesystem; nanosecond API units do not guarantee nanosecond storage precision. See the [Python timestamp documentation](https://docs.python.org/3/library/os.html#os.utime).
 
 `cp` verifies the main data stream; complete metadata preservation is not guaranteed. `mv` also copies and verifies accessible extended attributes, including macOS resource forks. If the destination cannot preserve them, source removal is blocked. Basic permissions and timestamps are set, but ownership, filesystem flags, and arbitrary NTFS alternate data streams are not covered by the transfer guarantee.
+
+On macOS, `com.apple.provenance` is treated separately: the operating system associates it with the application creating or modifying an object, so source and copy values may differ. `mv` leaves the destination's provenance value to macOS instead of writing the source value. `mv` and `rm` record differences in `destination_metadata_difference` events without rejecting the copy solely for that attribute. They do not delete or rewrite provenance attributes or change Gatekeeper settings. Source metadata must still match its snapshot. All other expected attributes, including resource forks, Finder information, quarantine and access-related attributes, remain strict; failures identify the attribute names and expected/actual hashes. This exception applies only to macOS. See [FFRI's provenance research](https://github.com/FFRI/ShowProvenanceInfo).
 
 The following are not supported:
 
