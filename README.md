@@ -10,7 +10,7 @@ Verified file copy and move for macOS and Linux.
 - macOS: `diskutil` and `ls`. Writing to NTFS requires a compatible driver. The system-provided `openrsync` is supported.
 - Linux: util-linux (`findmnt`, `lsblk`, `mount`, and `umount`). UDisks mode also requires `udisksctl`, the UDisks service, and appropriate polkit permissions.
 
-The test suite contains 112 tests and has passed on macOS using the installed `openrsync`. Volume discovery and remount operations are mocked in tests. Native Linux execution and compatibility with all external filesystem drivers have not been verified. The project is currently alpha software.
+The test suite contains 118 tests and has passed on macOS using the installed `openrsync`. Volume discovery and remount operations are mocked in tests. Native Linux execution and compatibility with all external filesystem drivers have not been verified. The project is currently alpha software.
 
 ## Installation and usage
 
@@ -39,9 +39,22 @@ safemv rm SOURCE DEST
 safemv cp SOURCE1 SOURCE2 DEST_DIRECTORY
 ```
 
-`cp` retains the source. `mv` automatically removes the specified sources after verification and, when required, a successful remount. There is no additional deletion prompt: selecting `mv` selects that behavior. Remounting an external volume always requires confirmation.
+`cp` retains the source. `mv` automatically removes the specified sources after verification and, when required, a successful remount. There is no additional deletion prompt: selecting `mv` selects that behavior. Remounting an external volume requires confirmation, supplied interactively or with `-y`.
 
 `rm` checks existing copies and removes originals after a separate confirmation. It accepts the same operand order as `mv`, creates its plan automatically, and performs no copying or remounting. See [Remove originals after an existing copy](#remove-originals-after-an-existing-copy).
+
+### Automatic confirmation
+
+Use `-y` or `--yes` to answer yes to remount and source-removal prompts for the current invocation:
+
+```bash
+safemv mv -y SOURCE DEST
+safemv rm -y SOURCE DEST
+safemv cp --yes SOURCE DEST
+safemv run -y --manifest /local/path/plan.jsonl
+```
+
+The option also works before the subcommand, for example `safemv -y rm SOURCE DEST`. With multiple sources, it applies to every job in that invocation. The affected paths and operations are still printed, and automatic confirmations are recorded with `confirmation: --yes` in the event log. No terminal input is read for these confirmations. Without the option, the existing interactive behavior remains unchanged. `-y` does not bypass checksums, metadata or volume checks, overwrite files, force an unmount, grant privileges, or ignore command failures.
 
 ## Source and destination paths
 
@@ -81,7 +94,7 @@ The prompt identifies the mount path, UUID, and device:
 Confirm remount of volume '/Volumes/External' (UUID ..., device ...)? [y/N]:
 ```
 
-Only `y`, case-insensitively, permits the operation. `n`, an empty response, or EOF stops the job; copies are retained and sources are not removed. Close other applications using the volume: the **entire destination volume** is briefly unavailable during this step. Forced unmounts, ejects, and power cycling are not used.
+Without `-y`, only an interactive `y`, case-insensitively, permits the operation. `n`, an empty response, or EOF stops the job; copies are retained and sources are not removed. Close other applications using the volume: the **entire destination volume** is briefly unavailable during this step. Forced unmounts, ejects, and power cycling are not used.
 
 On macOS, the script uses `diskutil mount DEVICE` and verifies the original mount path and UUID afterward. On Linux, the default is `--linux-remount system`; use `--linux-remount udisks` for volumes managed by UDisks. `--sudo-remount` explicitly enables `sudo -n` only for the Linux system mount and unmount commands. The necessary privileges must already be available. You do not need to run the entire script with sudo for this purpose.
 
@@ -139,7 +152,7 @@ After all checks pass, the command displays the source, destination, file count,
 Confirm removal of these verified originals? [y/N]:
 ```
 
-Only `y` permits removal. Other input or EOF leaves the originals in place. Sources and destination state are rechecked after confirmation. Only source entries listed in the plan are removed; directories must be empty. Removal bypasses Trash. If removal fails partway through, the remaining sources are retained and the log records partial progress; recover removed files by copying them back from the verified destination. The command requires the complete original source tree and does not resume partial deletion.
+Without `-y`, only an interactive `y` permits removal. Other input or EOF leaves the originals in place. Sources and destination state are rechecked after either interactive or automatic confirmation. Only source entries listed in the plan are removed; directories must be empty. Removal bypasses Trash. If removal fails partway through, the remaining sources are retained and the log records partial progress; recover removed files by copying them back from the verified destination. The command requires the complete original source tree and does not resume partial deletion.
 
 Positional operands create a new job with `plan.jsonl` and `plan.log`. With `--manifest`, the default log instead replaces the plan's final extension with `.rm.log`, keeping an existing transfer log intact. Use `--log /local/path/remove-02.log` for a different new log; existing logs are never overwritten. Successful completion prints `REMOVED` and records a final `moved` event in a log whose mode is `rm`. File contents are checked once at the destination, before confirmation; subsequent state checks have the same concurrent-modification limitations as `mv`.
 

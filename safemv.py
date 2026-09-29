@@ -668,11 +668,15 @@ def remount_commands(vol, sudo=False, linux_method='system'):
                       '--source', 'UUID=' + vol['uuid'], '--target', vol['mount']])
 
 
-def confirm_remount(vol, journal):
+def confirm_remount(vol, journal, yes=False):
     journal.event('remount_confirmation_requested', mount=vol['mount'], uuid=vol['uuid'], device=vol['device'])
     print('The entire destination volume will be briefly unavailable.', flush=True)
     prompt = 'Confirm remount of volume {} (UUID {}, device {})? [y/N]: '.format(
         repr(vol['mount']), vol['uuid'], vol['device'])
+    if yes:
+        print(prompt + 'y (--yes)', flush=True)
+        journal.event('remount_confirmed', uuid=vol['uuid'], confirmation='--yes')
+        return
     while True:
         try:
             answer = input(prompt).strip().lower()
@@ -688,13 +692,13 @@ def confirm_remount(vol, journal):
         print('Please enter y or n. Enter defaults to n.', flush=True)
 
 
-def remount(vol, journal, sudo=False, linux_method='system'):
+def remount(vol, journal, sudo=False, linux_method='system', yes=False):
     unmount_cmd, mount_cmd = remount_commands(vol, sudo, linux_method)
     # Before unmounting, resolve the UUID again. All file handles are already closed.
     current = volume(Path(vol['mount']))
     same_volume(vol, current)
     require(current['device'] == vol['device'], 'Device changed before unmount.')
-    confirm_remount(vol, journal)
+    confirm_remount(vol, journal, yes)
     # The disk may have changed while the operator was reading the prompt.
     current = volume(Path(vol['mount']))
     same_volume(vol, current)
@@ -891,7 +895,7 @@ def execute(args, verify_only=False):
         if not verify_only:
             check_verified_destination(header, entries, verified, journal, phase='before_remount')
             if actual['external']:
-                remount(actual, journal, args.sudo_remount, args.linux_remount)
+                remount(actual, journal, args.sudo_remount, args.linux_remount, getattr(args, 'yes', False))
             else:
                 journal.event('remount_skipped', reason='internal volume')
             verified = check_verified_destination(
@@ -919,7 +923,7 @@ def execute(args, verify_only=False):
         journal.close()
 
 
-def confirm_source_removal(header, journal):
+def confirm_source_removal(header, journal, yes=False):
     source, dest = header['source_root'], header['destination_root']
     journal.event('source_removal_confirmation_requested', source=source, destination=dest,
                   files=header['files'], bytes=header['bytes'])
@@ -928,6 +932,10 @@ def confirm_source_removal(header, journal):
         header['files'], header['bytes'], repr(source)), flush=True)
     print('Removal bypasses Trash and is not atomic. Recovery requires copying back from '
           'the verified destination; a failure may leave a partially removed source tree.', flush=True)
+    if yes:
+        print('Confirm removal of these verified originals? [y/N]: y (--yes)', flush=True)
+        journal.event('source_removal_confirmed', source=source, confirmation='--yes')
+        return
     try:
         answer = input('Confirm removal of these verified originals? [y/N]: ').strip().lower()
     except (EOFError, OSError):
@@ -980,7 +988,7 @@ def remove_existing_sources(args):
                       phase='before_source_removal')
         check_removal_sources(header, entries, journal)
         check_verified_destination(header, entries, verified, journal, phase='before_removal_confirmation')
-        confirm_source_removal(header, journal)
+        confirm_source_removal(header, journal, getattr(args, 'yes', False))
         deletion['verified_destinations'] = verified
         # Recheck after the prompt; files may have changed while it was open.
         remove_verified_source(header, entries, journal, deletion)
@@ -1054,7 +1062,8 @@ def automatic_transfer(args):
         task = argparse.Namespace(source=str(source), destination=str(target),
                                   manifest=str(job / 'plan.jsonl'), log=args.log,
                                   move=args.action in ('mv', 'rm'), sudo_remount=getattr(args, 'sudo_remount', False),
-                                  linux_remount=getattr(args, 'linux_remount', 'system'))
+                                  linux_remount=getattr(args, 'linux_remount', 'system'),
+                                  yes=getattr(args, 'yes', False))
         print('{}: {} -> {}'.format(args.action.upper(), repr(str(source)), repr(str(target))), flush=True)
         prepare(task, existing_destination=args.action == 'rm')
         if args.action == 'rm':
@@ -1067,10 +1076,13 @@ def automatic_transfer(args):
 
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
+    root.add_argument('-y', '--yes', action='store_true', help='Answer yes to remount and source-removal prompts for this invocation.')
     sub = root.add_subparsers(dest='action', required=True)
     for name in ('cp', 'mv'):
         part = sub.add_parser(name, help='Automatically plan, copy and verify' +
                              (', then remove the verified source.' if name == 'mv' else '.'))
+        part.add_argument('-y', '--yes', action='store_true', default=argparse.SUPPRESS,
+                          help='Automatically confirm remounting; verification remains required.')
         part.add_argument('paths', nargs='+', metavar='PATH', help='SOURCE... DESTINATION, as with cp/mv.')
         part.add_argument('--state-dir', help='Manifest/log storage (default: ~/.local/state/safe-transfer).')
         part.add_argument('--log', help='Optional custom log for a single transfer; default: generated plan path with .log extension.')
@@ -1086,10 +1098,14 @@ def parser():
         part.add_argument('--manifest', required=True)
         part.add_argument('--log', help='New log file (JSONL content); default: manifest path with its extension replaced by .log.')
         if name == 'run':
+            part.add_argument('-y', '--yes', action='store_true', default=argparse.SUPPRESS,
+                              help='Automatically confirm remounting; verification remains required.')
             part.add_argument('--sudo-remount', action='store_true', help='Linux only: explicitly use sudo -n for umount/mount only.')
             part.add_argument('--linux-remount', choices=('system', 'udisks'), default='system',
                               help='Linux: system mount/umount, or UDisks for desktop/FUSE volumes.')
     remove = sub.add_parser('rm', help='Verify existing copies, confirm, then remove originals; no copy or remount.')
+    remove.add_argument('-y', '--yes', action='store_true', default=argparse.SUPPRESS,
+                        help='Automatically confirm source removal after all checks pass.')
     remove.add_argument('paths', nargs='*', metavar='PATH', help='SOURCE... DESTINATION, as with mv; copies must already exist.')
     remove.add_argument('--state-dir', help='Automatic manifest/log storage (default: ~/.local/state/safe-transfer).')
     remove.add_argument('-r', '-R', '--recursive', action='store_true', help='Accepted for compatibility; directories are always recursive.')

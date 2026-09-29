@@ -941,6 +941,60 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.auto('rm', extra=['--manifest', self.manifest]), 2)
         self.assertTrue(self.source.exists())
 
+    def test_rm_yes_checks_copies_and_removes_without_input(self):
+        self.destination.mkdir()
+        self.assertEqual(self.auto('cp'), 0)
+        with mock.patch('builtins.input', side_effect=AssertionError('Unexpected prompt')):
+            self.assertEqual(self.auto('rm', extra=['-y']), 0)
+        self.assertFalse(self.source.exists())
+        logs = [p for p in (self.base / 'jobs').glob('*/plan.log') if '"mode": "rm"' in p.read_text()]
+        events = [json.loads(row) for row in logs[0].read_text().splitlines()]
+        confirmed = next(e for e in events if e['event'] == 'source_removal_confirmed')
+        self.assertEqual(confirmed['confirmation'], '--yes')
+
+    def test_rm_yes_does_not_bypass_checksum_failure(self):
+        self.existing_copy()
+        (self.destination / 'data.txt').write_bytes(b'bad copy')
+        with mock.patch('builtins.input', side_effect=AssertionError('Unexpected prompt')):
+            self.assertEqual(self.cli('rm', '-y', '--manifest', self.manifest), 3)
+        self.assertTrue((self.source / 'data.txt').exists())
+
+    def assert_yes_remount(self, action):
+        self.vol['external'] = True
+        seen = []
+        def remount(vol, journal, sudo, linux_method, yes):
+            self.assertTrue(yes)
+            t.confirm_remount(vol, journal, yes)
+            seen.append(True)
+        with mock.patch.object(t, 'check_manifest_location'), mock.patch.object(t, 'separate_source'), \
+             mock.patch.object(t, 'remount_commands'), mock.patch.object(t, 'remount', side_effect=remount), \
+             mock.patch('builtins.input', side_effect=AssertionError('Unexpected prompt')):
+            if action == 'run':
+                self.assertEqual(self.plan(), 0)
+                self.assertEqual(self.cli('-y', 'run', '--manifest', self.manifest), 0)
+            else:
+                self.assertEqual(self.auto(action, extra=['--yes']), 0)
+        self.assertEqual(seen, [True])
+        self.assertEqual(self.source.exists(), action != 'mv')
+
+    def test_cp_yes_propagates_to_remount(self):
+        self.assert_yes_remount('cp')
+
+    def test_mv_yes_propagates_to_remount(self):
+        self.assert_yes_remount('mv')
+
+    def test_run_global_yes_propagates_to_remount(self):
+        self.assert_yes_remount('run')
+
+    def test_yes_parser_positions_and_default(self):
+        for action in ('cp', 'mv', 'rm', 'run'):
+            operands = ['--manifest', 'plan.jsonl'] if action == 'run' else ['source', 'destination']
+            self.assertFalse(t.parser().parse_args([action, *operands]).yes)
+            for args in (['-y', action, *operands], [action, '-y', *operands],
+                         [action, *operands, '--yes']):
+                with self.subTest(args=args):
+                    self.assertTrue(t.parser().parse_args(args).yes)
+
     def test_rm_paths_requires_matching_nested_directory(self):
         self.existing_copy()
         # Like mv, an existing destination directory means DEST/SOURCE.name.
